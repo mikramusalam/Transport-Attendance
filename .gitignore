@@ -1,0 +1,7 @@
+node_modules
+dist
+face-models
+enrollment-photos
+.env
+*.log
+.DS_Store

@@ -1,0 +1,234 @@
+// Driver Attendance, Face Verification & Location System
+// PostgreSQL schema (Prisma ORM)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// EMPLOYEES (drivers, helpers, etc.)
+// ─────────────────────────────────────────────────────────────
+model Employee {
+  id             String    @id @default(uuid())
+  employeeCode   String    @unique @map("employee_code") // e.g. DRV-0247
+  fullName       String    @map("full_name")
+  phone          String?
+  email          String?
+  role           String    @default("Driver")
+
+  // Biometric enrollment. faceEmbedding is a JSON array of floats (128-d),
+  // produced by the self-hosted face recognition model. Never exposed via any
+  // public API. enrolledPhotoPath stores ONE reference photo on disk
+  // (not daily selfies) so an admin can visually confirm enrollment.
+  faceEmbedding    Json?     @map("face_embedding")
+  faceEnrolledAt   DateTime? @map("face_enrolled_at")
+  enrolledPhotoPath String?  @map("enrolled_photo_path")
+
+  status         String    @default("ACTIVE") // ACTIVE | INACTIVE
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  attendanceRecords   Attendance[]
+  attendanceSessions  AttendanceSession[]
+
+  @@map("employees")
+}
+
+// ─────────────────────────────────────────────────────────────
+// ATTENDANCE — the authoritative, immutable-by-default record
+// ─────────────────────────────────────────────────────────────
+model Attendance {
+  id                  String    @id @default(uuid())
+
+  employeeId          String    @map("employee_id")
+  employee            Employee  @relation(fields: [employeeId], references: [id])
+
+  // Free-text truck / number-plate entry — the driver types this in
+  // themselves, there is no truck list to maintain or select from.
+  truckNumber         String    @map("truck_number")
+
+  attendanceDate      DateTime  @map("attendance_date") @db.Date
+  attendanceTime      DateTime  @map("attendance_time")
+  status              String    // PRESENT | LATE
+
+  latitude            Float
+  longitude           Float
+  gpsAccuracy         Float     @map("gps_accuracy")
+
+  faceVerified        Boolean   @map("face_verified")
+  faceSimilarity      Float?    @map("face_similarity")
+  livenessVerified    Boolean?  @map("liveness_verified")
+  verificationMethod  String    @map("verification_method") // e.g. "face_embedding_v1+liveness_headturn"
+
+  // Short-lived visual audit trail: the verification selfie is kept on
+  // disk for a configurable number of days (default 3, see
+  // company_settings.selfieRetentionDays) so an admin can manually review
+  // it if there's ever a dispute, then it is automatically deleted by a
+  // background cleanup job. NOT kept indefinitely — this is a retention
+  // window, not permanent storage.
+  selfiePhotoPath     String?   @map("selfie_photo_path")
+  photoExpiresAt      DateTime? @map("photo_expires_at")
+  photoDeletedAt      DateTime? @map("photo_deleted_at")
+
+  sessionId           String?   @unique @map("session_id")
+
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  corrections         AttendanceCorrection[]
+
+  // One attendance record per employee per calendar day — enforced at the DB level.
+  @@unique([employeeId, attendanceDate])
+  @@index([attendanceDate])
+  @@index([photoExpiresAt])
+  @@map("attendance")
+}
+
+// ─────────────────────────────────────────────────────────────
+// ATTENDANCE SESSIONS — server-side state machine.
+// A driver cannot POST straight to /attendance/submit with arbitrary
+// employee_id/lat/lng/face_verified values. Every step of the flow
+// updates a session row that only the server can advance.
+//
+// Flow order (matches the exact driver experience requested):
+//   1. Location captured first (session is created here, anonymously)
+//   2. Employee number entered ("identify" — claim only, not proof)
+//   3. Selfie + liveness turn captured and verified (the actual proof)
+//   4. Truck / number-plate typed in
+//   5. Submit
+// ─────────────────────────────────────────────────────────────
+model AttendanceSession {
+  id                  String    @id @default(uuid())
+  token               String    @unique // opaque token handed to the browser
+
+  claimedEmployeeCode String?   @map("claimed_employee_code")
+  employeeId          String?   @map("employee_id")
+  employee            Employee? @relation(fields: [employeeId], references: [id])
+
+  status              String    @default("LOCATION_CAPTURED")
+  // LOCATION_CAPTURED -> IDENTIFIED -> FACE_VERIFIED -> TRUCK_ENTERED -> COMPLETED
+  // or FAILED / EXPIRED at any point
+
+  latitude            Float
+  longitude           Float
+  gpsAccuracy          Float   @map("gps_accuracy")
+
+  faceVerified        Boolean   @default(false) @map("face_verified")
+  faceSimilarity      Float?    @map("face_similarity")
+  livenessVerified    Boolean   @default(false) @map("liveness_verified")
+  livenessChallenge    String?  @map("liveness_challenge") // e.g. "LEFT" | "RIGHT"
+
+  // Verification selfie, saved to a temporary holding area as soon as the
+  // face check passes; moved into permanent (but still time-limited)
+  // storage under the Attendance record once the driver submits.
+  pendingPhotoPath    String?   @map("pending_photo_path")
+
+  truckNumber         String?   @map("truck_number")
+
+  faceAttempts        Int       @default(0) @map("face_attempts")
+
+  expiresAt           DateTime  @map("expires_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  @@index([token])
+  @@index([expiresAt])
+  @@map("attendance_sessions")
+}
+
+// ─────────────────────────────────────────────────────────────
+// ADMIN USERS
+// ─────────────────────────────────────────────────────────────
+model AdminUser {
+  id            String    @id @default(uuid())
+  name          String
+  email         String    @unique
+  passwordHash  String    @map("password_hash")
+  role          String    @default("VIEWER") // ADMIN | MANAGER | VIEWER
+  status        String    @default("ACTIVE") // ACTIVE | INACTIVE
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  auditLogs           AuditLog[]
+  attendanceCorrections AttendanceCorrection[]
+
+  @@map("admin_users")
+}
+
+// ─────────────────────────────────────────────────────────────
+// AUDIT LOGS
+// ─────────────────────────────────────────────────────────────
+model AuditLog {
+  id          String     @id @default(uuid())
+  adminId     String?    @map("admin_id")
+  admin       AdminUser? @relation(fields: [adminId], references: [id])
+  action      String     // e.g. "EMPLOYEE_CREATED", "TRUCK_DEACTIVATED"
+  entityType  String     @map("entity_type")
+  entityId    String?    @map("entity_id")
+  details     Json?
+  ipAddress   String?    @map("ip_address")
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────
+// ATTENDANCE CORRECTIONS — no silent deletes/edits
+// ─────────────────────────────────────────────────────────────
+model AttendanceCorrection {
+  id              String     @id @default(uuid())
+  attendanceId    String     @map("attendance_id")
+  attendance      Attendance @relation(fields: [attendanceId], references: [id])
+  adminId         String     @map("admin_id")
+  admin           AdminUser  @relation(fields: [adminId], references: [id])
+
+  previousStatus  String     @map("previous_status")
+  newStatus       String     @map("new_status")
+  previousTime    DateTime?  @map("previous_time")
+  newTime         DateTime?  @map("new_time")
+  reason          String
+
+  createdAt       DateTime   @default(now()) @map("created_at")
+
+  @@map("attendance_corrections")
+}
+
+// ─────────────────────────────────────────────────────────────
+// GOOGLE SHEETS SYNC CONFIG — optional secondary export, single row
+// ─────────────────────────────────────────────────────────────
+model SheetsConfig {
+  id            Int       @id @default(1)
+  webhookUrl    String    @default("") @map("webhook_url")
+  sheetName     String    @default("AttendanceLog") @map("sheet_name")
+  autoSync      Boolean   @default(false) @map("auto_sync")
+  lastSyncedAt  DateTime? @map("last_synced_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@map("sheets_config")
+}
+
+// ─────────────────────────────────────────────────────────────
+// COMPANY SETTINGS — single row of configurable business rules
+// ─────────────────────────────────────────────────────────────
+model CompanySettings {
+  id                          Int      @id @default(1)
+  companyName                 String   @default("Company") @map("company_name")
+  timezone                    String   @default("Asia/Karachi")
+  shiftStartTime              String   @default("08:00") @map("shift_start_time") // "HH:mm" 24h
+  gracePeriodMinutes          Int      @default(15) @map("grace_period_minutes")
+  gpsAccuracyThresholdMeters  Int      @default(100) @map("gps_accuracy_threshold_meters")
+  faceMatchThreshold          Float    @default(0.55) @map("face_match_threshold")
+  workingDays                 String   @default("Mon,Tue,Wed,Thu,Fri,Sat") @map("working_days")
+  maxFaceAttempts              Int     @default(5) @map("max_face_attempts")
+  sessionTtlMinutes            Int     @default(10) @map("session_ttl_minutes")
+  selfieRetentionDays          Int     @default(3) @map("selfie_retention_days")
+  updatedAt                   DateTime @updatedAt @map("updated_at")
+
+  @@map("company_settings")
+}

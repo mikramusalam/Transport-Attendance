@@ -1,0 +1,11 @@
+# Caddy automatically obtains & renews free Let's Encrypt HTTPS certificates
+# for these domains. Replace with your real domains, then point BOTH
+# subdomains' DNS A records at this server's IP address before starting.
+
+attendance.yourcompany.com {
+    reverse_proxy app:3000
+}
+
+admin.yourcompany.com {
+    reverse_proxy app:3000
+}

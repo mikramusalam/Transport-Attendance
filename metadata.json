@@ -1,0 +1,8 @@
+{
+  "name": "Driver Attendance, Face Verification & Location System",
+  "description": "Mobile-first driver attendance and location verification system for transport fleets: GPS capture, self-hosted face verification with liveness challenge, truck logging, and a secure admin dashboard.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
